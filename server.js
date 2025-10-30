@@ -50,10 +50,14 @@ if (useGoogleTts) {
                     // Not base64 or not JSON; assume raw JSON string
                 }
                 const creds = JSON.parse(credsStr);
+                // Normalize private_key newlines when provided via env vars (e.g. Render)
+                const normalizedPrivateKey = creds.private_key && typeof creds.private_key === "string"
+                    ? creds.private_key.replace(/\\n/g, "\n")
+                    : creds.private_key;
                 clientOptions = {
                     credentials: {
                         client_email: creds.client_email,
-                        private_key: creds.private_key
+                        private_key: normalizedPrivateKey
                     },
                     projectId: creds.project_id
                 };
