@@ -18,14 +18,52 @@ ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 // __dirname is available in CommonJS by default
-const useGoogleTts = process.env.USE_GOOGLE_TTS === "1";
+let useGoogleTts = process.env.USE_GOOGLE_TTS == "1";
+// Also enable automatically if credentials are provided as env or path
+const googleTtsCredsEnv = process.env.GOOGLE_TTS_CREDENTIALS; // path OR raw/base64 JSON
+const googleTtsCredsPathEnv = process.env.GOOGLE_TTS_CREDENTIALS_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS; // file path
+if (!useGoogleTts && (googleTtsCredsEnv || googleTtsCredsPathEnv)) {
+    useGoogleTts = true;
+}
+
 if (useGoogleTts) {
     try {
         TextToSpeechClient = require("@google-cloud/text-to-speech").TextToSpeechClient;
-        googleTtsClient = new TextToSpeechClient();
+        let clientOptions = undefined;
+        if (googleTtsCredsPathEnv && fs.existsSync(googleTtsCredsPathEnv)) {
+            // Use key file from provided path or GOOGLE_APPLICATION_CREDENTIALS
+            clientOptions = { keyFilename: googleTtsCredsPathEnv };
+        } else if (googleTtsCredsEnv) {
+            // GOOGLE_TTS_CREDENTIALS may be a file path OR raw/base64 JSON
+            if (fs.existsSync(googleTtsCredsEnv)) {
+                clientOptions = { keyFilename: googleTtsCredsEnv };
+            } else {
+                // Support raw JSON or base64-encoded JSON in GOOGLE_TTS_CREDENTIALS
+                let credsStr = googleTtsCredsEnv;
+                try {
+                    // If base64, decode
+                    const maybeDecoded = Buffer.from(googleTtsCredsEnv, "base64").toString("utf8");
+                    // Heuristic: base64 decode will produce a string; try JSON.parse to verify
+                    JSON.parse(maybeDecoded);
+                    credsStr = maybeDecoded;
+                } catch (_) {
+                    // Not base64 or not JSON; assume raw JSON string
+                }
+                const creds = JSON.parse(credsStr);
+                clientOptions = {
+                    credentials: {
+                        client_email: creds.client_email,
+                        private_key: creds.private_key
+                    },
+                    projectId: creds.project_id
+                };
+            }
+        }
+        googleTtsClient = new TextToSpeechClient(clientOptions);
         console.log("🔊 Using Google Cloud Text-to-Speech");
     } catch (e) {
-        console.warn("Google TTS not available, falling back to gTTS:", e.message);
+        console.warn("Google TTS not available, falling back to OS TTS:", e.message);
+        useGoogleTts = false;
     }
 }
 
