@@ -8,20 +8,23 @@ const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const ffprobeInstaller = require("@ffprobe-installer/ffprobe");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const say = require("say");
-let TextToSpeechClient = null;
-let googleTtsClient = null;
 
 dotenv.config();
 
-// ✅ Auto configure ffmpeg + ffprobe paths for all OS
+// ✅ Configure ffmpeg + ffprobe
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
-// __dirname is available in CommonJS by default
-let useGoogleTts = process.env.USE_GOOGLE_TTS == "1";
-// Also enable automatically if credentials are provided as env or path
-const googleTtsCredsEnv = process.env.GOOGLE_TTS_CREDENTIALS; // path OR raw/base64 JSON
-const googleTtsCredsPathEnv = process.env.GOOGLE_TTS_CREDENTIALS_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS; // file path
+// Environment setup
+let useGoogleTts = process.env.USE_GOOGLE_TTS === "1";
+const googleTtsCredsEnv = process.env.GOOGLE_TTS_CREDENTIALS;
+const googleTtsCredsPathEnv =
+    process.env.GOOGLE_TTS_CREDENTIALS_PATH || process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+let TextToSpeechClient = null;
+let googleTtsClient = null;
+
+// ✅ Enable Google TTS if credentials exist
 if (!useGoogleTts && (googleTtsCredsEnv || googleTtsCredsPathEnv)) {
     useGoogleTts = true;
 }
@@ -29,44 +32,51 @@ if (!useGoogleTts && (googleTtsCredsEnv || googleTtsCredsPathEnv)) {
 if (useGoogleTts) {
     try {
         TextToSpeechClient = require("@google-cloud/text-to-speech").TextToSpeechClient;
-        let clientOptions = undefined;
+        let clientOptions;
+
         if (googleTtsCredsPathEnv && fs.existsSync(googleTtsCredsPathEnv)) {
-            // Use key file from provided path or GOOGLE_APPLICATION_CREDENTIALS
+            console.log("🔊 Google TTS: using key file path");
             clientOptions = { keyFilename: googleTtsCredsPathEnv };
         } else if (googleTtsCredsEnv) {
-            // GOOGLE_TTS_CREDENTIALS may be a file path OR raw/base64 JSON
+            // Can be base64, path, or inline JSON
+            let credsStr = googleTtsCredsEnv;
+
             if (fs.existsSync(googleTtsCredsEnv)) {
+                console.log("🔊 Google TTS: using credentials file path");
                 clientOptions = { keyFilename: googleTtsCredsEnv };
             } else {
-                // Support raw JSON or base64-encoded JSON in GOOGLE_TTS_CREDENTIALS
-                let credsStr = googleTtsCredsEnv;
                 try {
-                    // If base64, decode
+                    // Try base64 decode
                     const maybeDecoded = Buffer.from(googleTtsCredsEnv, "base64").toString("utf8");
-                    // Heuristic: base64 decode will produce a string; try JSON.parse to verify
                     JSON.parse(maybeDecoded);
                     credsStr = maybeDecoded;
                 } catch (_) {
-                    // Not base64 or not JSON; assume raw JSON string
+                    // not base64 → assume raw JSON
                 }
+
                 const creds = JSON.parse(credsStr);
-                // Normalize private_key newlines when provided via env vars (e.g. Render)
-                const normalizedPrivateKey = creds.private_key && typeof creds.private_key === "string"
-                    ? creds.private_key.replace(/\\n/g, "\n")
-                    : creds.private_key;
+                let normalizedPrivateKey = creds.private_key;
+
+                if (typeof normalizedPrivateKey === "string") {
+                    normalizedPrivateKey = normalizedPrivateKey.replace(/\r/g, "");
+                    normalizedPrivateKey = normalizedPrivateKey.replace(/\\n/g, "\n").trim();
+                }
+
                 clientOptions = {
                     credentials: {
                         client_email: creds.client_email,
-                        private_key: normalizedPrivateKey
+                        private_key: normalizedPrivateKey,
                     },
-                    projectId: creds.project_id
+                    projectId: creds.project_id,
                 };
+                console.log("🔊 Google TTS: using inline credentials");
             }
         }
+
         googleTtsClient = new TextToSpeechClient(clientOptions);
-        console.log("🔊 Using Google Cloud Text-to-Speech");
-    } catch (e) {
-        console.warn("Google TTS not available, falling back to OS TTS:", e.message);
+        console.log("✅ Google Cloud Text-to-Speech ready");
+    } catch (err) {
+        console.warn("⚠️ Google TTS unavailable, falling back to OS TTS:", err.message);
         useGoogleTts = false;
     }
 }
@@ -75,35 +85,30 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Gemini setup
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 const model = genAI.getGenerativeModel({ model: "models/gemini-2.5-flash" });
 
-// output directory for temporary audio files
+// Output directory for audio files
 const OUTPUT_DIR = path.join(__dirname, "output");
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR);
 
-// helper: select OS voice name by gender
+// OS voice selection by gender
 function getOsVoiceNameByGender(gender) {
     const isWin = process.platform === "win32";
     const isMac = process.platform === "darwin";
-    if (isWin) {
-        return gender === "male" ? "Microsoft David Desktop" : "Microsoft Zira Desktop";
-    }
-    if (isMac) {
-        return gender === "male" ? "Alex" : "Samantha";
-    }
-    // Linux (espeak), try gender-specific variants
-    return gender === "male" ? "en+m3" : "en+f3";
+    if (isWin) return gender === "male" ? "Microsoft David Desktop" : "Microsoft Zira Desktop";
+    if (isMac) return gender === "male" ? "Alex" : "Samantha";
+    return gender === "male" ? "en+m3" : "en+f3"; // Linux
 }
 
-// 🔊 Convert text array to audio
+// 🔉 Convert script to audio
 async function convertScriptToAudio(script, genderMap) {
     const tempFiles = [];
 
-    // 1️⃣ Generate individual clips
     for (let i = 0; i < script.length; i++) {
         const { speaker, text } = script[i];
-        const gender = genderMap && genderMap[speaker] ? genderMap[speaker] : undefined;
+        const gender = genderMap?.[speaker];
         const tempPath = path.join(OUTPUT_DIR, `clip_${i}.mp3`);
 
         if (useGoogleTts && googleTtsClient) {
@@ -111,26 +116,23 @@ async function convertScriptToAudio(script, genderMap) {
             const request = {
                 input: { text },
                 voice: { languageCode: "en-US", ssmlGender },
-                audioConfig: { audioEncoding: "MP3" }
+                audioConfig: { audioEncoding: "MP3" },
             };
+
             const [response] = await googleTtsClient.synthesizeSpeech(request);
-            const audioBuffer = Buffer.isBuffer(response.audioContent)
-                ? response.audioContent
-                : Buffer.from(response.audioContent, "base64");
+            const audioBuffer = Buffer.from(response.audioContent, "base64");
             fs.writeFileSync(tempPath, audioBuffer);
             tempFiles.push(tempPath);
         } else {
-            // Use OS-native TTS via say: export to wav then convert/merge to final mp3
             const wavPath = path.join(OUTPUT_DIR, `clip_${i}.wav`);
             const voiceName = getOsVoiceNameByGender(gender);
             await new Promise((resolve, reject) => {
                 say.export(text, voiceName, 1.0, wavPath, (err) => {
                     if (err) return reject(err);
-                    // Convert wav to mp3 for consistency
                     ffmpeg(wavPath)
                         .toFormat("mp3")
                         .on("end", () => {
-                            try { fs.unlinkSync(wavPath); } catch { }
+                            fs.unlinkSync(wavPath);
                             tempFiles.push(tempPath);
                             resolve();
                         })
@@ -141,15 +143,14 @@ async function convertScriptToAudio(script, genderMap) {
         }
     }
 
-    // 2️⃣ Merge clips into one final mp3
+    // Merge all clips
     const finalFile = path.join(OUTPUT_DIR, `podcast_${Date.now()}.mp3`);
     await new Promise((resolve, reject) => {
         const ff = ffmpeg();
         tempFiles.forEach((file) => ff.input(file));
         ff.mergeToFile(finalFile)
             .on("end", () => {
-                // cleanup individual clips
-                tempFiles.forEach(f => fs.unlinkSync(f));
+                tempFiles.forEach((f) => fs.unlinkSync(f));
                 resolve();
             })
             .on("error", reject);
@@ -158,50 +159,38 @@ async function convertScriptToAudio(script, genderMap) {
     return finalFile;
 }
 
-// 🎙 Podcast generation route
+// 🎙 Podcast route
 app.post("/api/generate-podcast", async (req, res) => {
     try {
         const { topic, host, guestname, info, hostGender, guestGender } = req.body;
-
         if (!topic || !host) {
             return res.status(400).json({ error: "Please provide a topic and host name." });
         }
 
         const guests = Array.isArray(guestname) ? guestname : [];
-        const guestList = guests.length ? guests.join(", ") : "No guests";
         const genderMap = {};
         if (host) genderMap[host] = hostGender;
         for (const g of guests) genderMap[g] = guestGender;
+
         const prompt = `
 You are a professional podcast scriptwriter. Write a 15-minute podcast script on the topic: "${topic}".
 Podcast details:
 - Host: ${host}
-- Guests: ${guestList.length ? guestList : "No guests"}
-- Additional info: ${info || "No extra information provided"}
- 
-Instructions:
-- Write in a natural, conversational style suitable for humans speaking aloud.
-- Each line should be an object in an array with keys:
-  { speaker: "SpeakerName", text: "Dialogue" }
-- Format output ONLY as a JSON array of objects. Do NOT include any extra explanation or text outside the array.
-- Each guest should have a distinct voice and speaking style.
-- Include: engaging introduction, discussion points, short stories or examples, and conclusion with a call to action.
-- Make it ready to use directly in your frontend for rendering or TTS conversion.
- - IMPORTANT: Use speaker names EXACTLY as provided for the host and guests: Host is "${host}" and guests are: ${guestList}. Do not invent new names.
+- Guests: ${guests.length ? guests.join(", ") : "No guests"}
+- Info: ${info || "No extra info"}
+Format as JSON array only: [{ "speaker": "Name", "text": "Dialogue" }]
 `;
 
         const result = await model.generateContent(prompt);
-        let script = await result.response.text();
-        script = script.replace(/```(json)?/g, "").trim();
+        let script = result.response.text().replace(/```(json)?/g, "").trim();
 
         try {
             script = JSON.parse(script);
         } catch (err) {
-            console.error("JSON parse error:", err);
-            return res.status(500).json({ error: "AI output invalid format." });
+            console.error("❌ JSON parse error:", err);
+            return res.status(500).json({ error: "AI output invalid format" });
         }
 
-        // 🗣 Generate audio
         const audioFile = await convertScriptToAudio(script, genderMap);
         const fileUrl = `/audio/${path.basename(audioFile)}`;
 
@@ -212,10 +201,9 @@ Instructions:
     }
 });
 
-// serve generated audio files
+// Serve generated audio
 app.use("/audio", express.static(OUTPUT_DIR));
 
-// UI is served separately by Vite (port 3000) during development
-
+// Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
