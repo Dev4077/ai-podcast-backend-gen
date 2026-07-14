@@ -85,9 +85,51 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Gemini setup
+// Gemini setup — primary + fallbacks for 503 / high demand
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
-const model = genAI.getGenerativeModel({ model: "models/gemini-2.5-flash" });
+const GEMINI_MODELS = [
+    process.env.GEMINI_MODEL,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+].filter(Boolean);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isRetryableGeminiError(err) {
+    const status = err?.status ?? err?.statusCode;
+    const msg = String(err?.message || "");
+    return (
+        status === 503 ||
+        status === 429 ||
+        /high demand|overloaded|unavailable|try again later|quota|rate/i.test(msg)
+    );
+}
+
+async function generateWithGemini(prompt, { maxRetries = 3 } = {}) {
+    let lastError;
+
+    for (const modelName of GEMINI_MODELS) {
+        const model = genAI.getGenerativeModel({ model: modelName });
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                console.log(`🤖 Gemini model=${modelName} attempt=${attempt}`);
+                return await model.generateContent(prompt);
+            } catch (err) {
+                lastError = err;
+                console.warn(`⚠️ Gemini ${modelName} failed (attempt ${attempt}):`, err.message);
+
+                if (!isRetryableGeminiError(err) || attempt === maxRetries) break;
+
+                const delayMs = Math.min(1000 * 2 ** (attempt - 1), 8000);
+                await sleep(delayMs);
+            }
+        }
+    }
+
+    throw lastError;
+}
 
 // Output directory for audio files
 const OUTPUT_DIR = path.join(__dirname, "output");
@@ -102,6 +144,42 @@ function getOsVoiceNameByGender(gender) {
     return gender === "male" ? "en+m3" : "en+f3"; // Linux
 }
 
+function isGoogleTtsBillingError(err) {
+    const msg = String(err?.message || err || "");
+    return /BILLING_DISABLED|billing to be enabled|ACCOUNT_BILLING_DISABLED/i.test(msg);
+}
+
+async function synthesizeWithOsTts(text, gender, tempPath) {
+    const wavPath = path.join(OUTPUT_DIR, `clip_${path.basename(tempPath, ".mp3")}.wav`);
+    const voiceName = getOsVoiceNameByGender(gender);
+    await new Promise((resolve, reject) => {
+        say.export(text, voiceName, 1.0, wavPath, (err) => {
+            if (err) return reject(err);
+            ffmpeg(wavPath)
+                .toFormat("mp3")
+                .on("end", () => {
+                    if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
+                    resolve();
+                })
+                .on("error", reject)
+                .save(tempPath);
+        });
+    });
+}
+
+async function synthesizeWithGoogleTts(text, gender, tempPath) {
+    const ssmlGender = gender === "male" ? "MALE" : gender === "female" ? "FEMALE" : "NEUTRAL";
+    const request = {
+        input: { text },
+        voice: { languageCode: "en-US", ssmlGender },
+        audioConfig: { audioEncoding: "MP3" },
+    };
+
+    const [response] = await googleTtsClient.synthesizeSpeech(request);
+    const audioBuffer = Buffer.from(response.audioContent, "base64");
+    fs.writeFileSync(tempPath, audioBuffer);
+}
+
 // 🔉 Convert script to audio
 async function convertScriptToAudio(script, genderMap) {
     const tempFiles = [];
@@ -112,35 +190,24 @@ async function convertScriptToAudio(script, genderMap) {
         const tempPath = path.join(OUTPUT_DIR, `clip_${i}.mp3`);
 
         if (useGoogleTts && googleTtsClient) {
-            const ssmlGender = gender === "male" ? "MALE" : gender === "female" ? "FEMALE" : "NEUTRAL";
-            const request = {
-                input: { text },
-                voice: { languageCode: "en-US", ssmlGender },
-                audioConfig: { audioEncoding: "MP3" },
-            };
-
-            const [response] = await googleTtsClient.synthesizeSpeech(request);
-            const audioBuffer = Buffer.from(response.audioContent, "base64");
-            fs.writeFileSync(tempPath, audioBuffer);
-            tempFiles.push(tempPath);
+            try {
+                await synthesizeWithGoogleTts(text, gender, tempPath);
+            } catch (err) {
+                if (isGoogleTtsBillingError(err)) {
+                    console.warn(
+                        "⚠️ Google TTS billing disabled — falling back to OS TTS. Enable billing: https://console.developers.google.com/billing"
+                    );
+                    useGoogleTts = false;
+                    await synthesizeWithOsTts(text, gender, tempPath);
+                } else {
+                    throw err;
+                }
+            }
         } else {
-            const wavPath = path.join(OUTPUT_DIR, `clip_${i}.wav`);
-            const voiceName = getOsVoiceNameByGender(gender);
-            await new Promise((resolve, reject) => {
-                say.export(text, voiceName, 1.0, wavPath, (err) => {
-                    if (err) return reject(err);
-                    ffmpeg(wavPath)
-                        .toFormat("mp3")
-                        .on("end", () => {
-                            fs.unlinkSync(wavPath);
-                            tempFiles.push(tempPath);
-                            resolve();
-                        })
-                        .on("error", reject)
-                        .save(tempPath);
-                });
-            });
+            await synthesizeWithOsTts(text, gender, tempPath);
         }
+
+        tempFiles.push(tempPath);
     }
 
     // Merge all clips
@@ -150,7 +217,9 @@ async function convertScriptToAudio(script, genderMap) {
         tempFiles.forEach((file) => ff.input(file));
         ff.mergeToFile(finalFile)
             .on("end", () => {
-                tempFiles.forEach((f) => fs.unlinkSync(f));
+                tempFiles.forEach((f) => {
+                    if (fs.existsSync(f)) fs.unlinkSync(f);
+                });
                 resolve();
             })
             .on("error", reject);
@@ -181,7 +250,7 @@ Podcast details:
 Format as JSON array only: [{ "speaker": "Name", "text": "Dialogue" }]
 `;
 
-        const result = await model.generateContent(prompt);
+        const result = await generateWithGemini(prompt);
         let script = result.response.text().replace(/```(json)?/g, "").trim();
 
         try {
@@ -197,6 +266,20 @@ Format as JSON array only: [{ "speaker": "Name", "text": "Dialogue" }]
         res.json({ topic, host, guestname: guests, script, audio: fileUrl });
     } catch (error) {
         console.error("Error generating podcast:", error);
+
+        if (isGoogleTtsBillingError(error)) {
+            return res.status(502).json({
+                error:
+                    "Google Cloud Text-to-Speech requires billing on project 847826359209. Enable it at https://console.developers.google.com/billing/enable?project=847826359209 then redeploy, or set USE_GOOGLE_TTS=0.",
+            });
+        }
+
+        if (isRetryableGeminiError(error)) {
+            return res.status(503).json({
+                error: "Gemini is temporarily overloaded. Please try again in a moment.",
+            });
+        }
+
         res.status(500).json({ error: "Failed to generate podcast script or audio." });
     }
 });
