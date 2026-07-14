@@ -18,8 +18,10 @@
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@ffprobe-installer/ffprobe": "^2.1.2",
-    "@google/generative-ai": "^0.24.1",
     "@google-cloud/text-to-speech": "^5.7.0",
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.1",
+    "cheerio": "^1.1.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
