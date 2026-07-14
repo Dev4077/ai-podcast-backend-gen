@@ -20,8 +20,6 @@ pids
 *.pid.lock
 
 # Environment variables
-.env
-.env.*
 !.env.example
 
 # Coverage reports
@@ -55,3 +53,4 @@ temp_auto_push.bat
 temp_interactive_push.bat
 .gitignore
 branch_structure.json
+config.bat
